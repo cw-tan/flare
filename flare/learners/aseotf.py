@@ -11,20 +11,21 @@ import os
 import time
 
 
-# TODOs:
-# 1. wandb logging
+
+eVperA3_to_GPa = 160.21766208
 
 formatter = logging.Formatter('%(asctime)s: %(message)s')
 
 
-def setup_logger(name, log_file, level=logging.INFO):
+def setup_logger(log_file, level=logging.INFO):
     """
     To set up loggers
     """
     handler = logging.FileHandler(log_file)
     handler.setFormatter(formatter)
-    logger = logging.getLogger(name)
+    logger = logging.getLogger(__name__)
     logger.setLevel(level)
+    logger.handlers.clear()
     logger.addHandler(handler)
     return logger
 
@@ -138,6 +139,7 @@ class FlareOTF(Calculator):
                  always_DFT: Optional[bool] = False,
                  never_learn: Optional[bool] = False,
                  path: Optional[str] = None,
+                 wandb: object = None,
                  ) -> object:
 
         # initialize ASE calculator attributes
@@ -210,7 +212,10 @@ class FlareOTF(Calculator):
 
         # recording purposes
         if path is not None:
-            self.path = path
+            if path.endswith('/'):
+                self.path = path[:-1]
+            else:
+                self.path = path
         else:
             self.path = os.getcwd()
         self.calls = 0  # total calls to the calculator
@@ -220,14 +225,15 @@ class FlareOTF(Calculator):
         self.last_dft_call = -100
 
         # for recording purposes
-        self.logger = setup_logger('aseotf', self.path + '/flare_aseotf.log')
+        self.logger = setup_logger(self.path + '/flare_aseotf.log')
+        self.wandb = wandb
+
         self.time_dft = 0.0
         self.time_hyp_opt = 0.0
         self.time_training = 0.0
         self.time_predict_uncertainties = 0.0
         self.time_prediction = 0.0
         self.time_ase = 0.0
-        self.t0 = time.time()
 
     def calculate(self, atoms, properties=None, system_changes=all_changes):
         """
@@ -240,7 +246,7 @@ class FlareOTF(Calculator):
             natoms = len(atoms.numbers)
             if self.dft_calls == 0 and self.calls == 0:
                 pe, F, stress = self.__run_dft()
-                self.__update_sgp(init=True, atoms_to_add=int(natoms/4))
+                self.__update_sgp(init=True, atoms_to_add=int(natoms / 2))  # randomly choose half
             else:
                 # get local cluster uncertainties
                 t0 = time.time()
@@ -249,38 +255,46 @@ class FlareOTF(Calculator):
                 self.time_predict_uncertainties += time.time() - t0
                 stds = np.sqrt(np.abs(variances)) / sigma
                 call_dft = np.any(stds > self.dft_call_threshold)
+                atoms2add = np.arange(natoms)[stds > self.dft_add_threshold]
 
-                # record
-                self.logger.info('Max uncertainty       : {:.16f}'.format(stds.max()))
+                # log cluster uncertainty (and save frames) 
+                self.logger.info('Max cluster uncertainty      : {:.16f}'.format(stds.max()))
                 if self.std_xyz_fname is not None:
                     frame = atoms.copy()
-                    frame.set_array("charges", stds)
-                    ase.io.write(self.std_xyz_fname.replace("*", str(self.calls)), frame, format="extxyz")
+                    frame.set_array('charges', stds)
+                    ase.io.write(self.std_xyz_fname.replace('*', str(self.calls)), frame, format='extxyz')
 
-                if call_dft or self.always_DFT:
-                    # get SGP mean prediction with DTC variances
-                    t0 = time.time()
-                    self.sparse_gp.predict_DTC(self.structure)
-                    self.time_prediction += time.time() - t0
-                    predE = self.structure.mean_efs[0]
-                    predF = self.structure.mean_efs[1:-6].reshape((-1, 3)).copy()
-                    predS = flare2ase(self.structure.mean_efs[-6:].copy())
-                    Estd = np.sqrt(np.abs(self.structure.variance_efs[0]))
-                    Fstd = np.sqrt(np.abs(self.structure.variance_efs[1:-6])).reshape((-1, 3))
-                    Sstd = np.sqrt(np.abs(self.structure.variance_efs[-6:]))
-                    self.logger.info('Energy uncertainty    : {:.16f}'.format(Estd))
-                    self.logger.info('Max force uncertainty : {:.16f}'.format(Fstd.max()))
-                    self.logger.info('Max stress uncertainty: {:.16f}'.format(Sstd.max()))
-
+                if self.never_learn or not call_dft:  # just get mean, uncertainties not necessary 
+                    # update ASE calculator results (energy, forces, stress) with SGP
+                    predE, predF, predS = self.__predict_from_sgp(mode='mean')
+                    self.results["energy"] = predE
+                    self.results["forces"] = predF
+                    self.results["stress"] = predS
+                else: 
                     # call DFT and update SGP model
                     pe, forces, stress = self.__run_dft()
-                    atoms2add = np.arange(natoms)[stds > self.dft_add_threshold]
-                    # log data based on DFT calculation
-                    self.logger.info('|ΔE per atom|: {:.16f}'.format(np.abs(pe - predE) / natoms))
-                    self.logger.info('Max |ΔForce| : {:.16f}'.format(np.abs(forces - predF).max()))
-                    self.logger.info('Max |ΔStress|: {:.16f}'.format(np.abs(stress - predS).max()))
-                    t0 = time.time()
-                    if not self.never_learn:
+
+                    if not self.always_DFT:
+                        predE, predF, predS = self.__predict_from_sgp(mode='dtc')
+                        # log data based on DFT calculation
+                        errF = np.abs(forces - predF)
+                        errS = np.abs(stress - predS)
+                        self.logger.info('DFT energy error [meV/atom]  : {:^14.8f}'.format(1000 * np.abs(pe - predE) / natoms))
+                        self.logger.info('Max & Mean DFT force error [meV/Å]  : {:^14.8f} {:^14.8f}'
+                                         .format(1000 * errF.max(), 1000 * np.mean(errF)))
+                        self.logger.info('Max & Mean DFT stress error [GPa]   : {:^14.8f} {:^14.8f}'
+                                         .format(eVperA3_to_GPa * errS.max(), eVperA3_to_GPa * np.mean(errS)))
+                        if self.wandb is not None:  # wandb logging
+                            wandb_log = {'max_cluster_uncertainty': stds.max()}
+                            wandb_log['max_force_error'] = 1000 * errF.max()
+                            wandb_log['mean_force_error'] = 1000 * np.mean(errF)
+                            wandb_log['log_rel_force_error'] = self.wandb.Histogram(np.log10(errF / np.abs(forces)).ravel())
+                            wandb_log['max_stress_error'] = eVperA3_to_GPa * errS.max()
+                            wandb_log['mean_stress_error'] = eVperA3_to_GPa * np.mean(errS)
+                            wandb_log['log_rel_stress_error'] = self.wandb.Histogram(np.log10(errS / np.abs(stress)).ravel())
+                            wandb_log['aseotf_call'] = self.calls
+                            self.wandb.log(wandb_log, step=self.dft_calls)  # only log when DFT called
+
                         # update SGP and potentially optimize SGP hyperparameters
                         self.__update_sgp(init=False, atoms_to_add=atoms2add)
                         if self.hyperparameter_optimization(self, self.atoms):
@@ -293,20 +307,6 @@ class FlareOTF(Calculator):
                             self.time_hyp_opt += time.time() - t0
                             self.hyp_opts += 1
                             self.dn_atenvs_since_hypopt = 0
-                    self.t0 = time.time()
-                else:
-                    # get SGP mean prediction
-                    t0 = time.time()
-                    self.sparse_gp.predict_mean(self.structure)
-                    self.time_prediction += time.time() - t0
-                    predE = self.structure.mean_efs[0]
-                    predF = self.structure.mean_efs[1:-6].reshape((-1, 3)).copy()
-                    predS = flare2ase(self.structure.mean_efs[-6:].copy())
-                    # update ASE calculator results (energy, forces, stress) with SGP
-                    self.results["energy"] = predE
-                    self.results["forces"] = predF
-                    self.results["stress"] = predS
-
             self.calls += 1
             self.record_state(self.path + '/flare_aseotf.state')
 
@@ -350,12 +350,14 @@ class FlareOTF(Calculator):
             frame = read(path2frame)
             natoms = len(frame.numbers)
             pe = frame.get_potential_energy()
+            if not isinstance(pe, float):
+                pe = float(pe.split(' ')[0])  # dirty workaround
             forces = frame.get_forces()
             stress = frame.get_stress()
             self.__reset_structure(frame)  # sets up the SGP structure object (among other things)
             if j == 0:
                 self.__update_structure_efs(pe, forces, stress)
-                self.__update_sgp(init=True, atoms_to_add=int(natoms/4))
+                self.__update_sgp(init=True, atoms_to_add=int(natoms / 4))
             else:
                 # get uncertainties
                 t0 = time.time()
@@ -364,28 +366,24 @@ class FlareOTF(Calculator):
                 self.time_predict_uncertainties += time.time() - t0
                 stds = np.sqrt(np.abs(variances)) / sigma
                 add_envs = np.any(stds > self.dft_call_threshold)
-                self.logger.info('Max uncertainty       : {:.16f}'.format(stds.max()))
+                self.logger.info('Max cluster uncertainty      : {:.16f}'.format(stds.max()))
 
-                # get SGP prediction and uncertainties
-                t0 = time.time()
-                self.sparse_gp.predict_DTC(self.structure)
-                self.time_prediction += time.time() - t0
-                predE = self.structure.mean_efs[0]
-                predF = self.structure.mean_efs[1:-6].reshape((-1, 3)).copy()
-                predS = flare2ase(self.structure.mean_efs[-6:].copy())
-                Estd = np.sqrt(np.abs(self.structure.variance_efs[0]))
-                Fstd = np.sqrt(np.abs(self.structure.variance_efs[1:-6])).reshape((-1, 3))
-                Sstd = np.sqrt(np.abs(self.structure.variance_efs[-6:]))
-                self.logger.info('Energy uncertainty    : {:.16f}'.format(Estd))
-                self.logger.info('Max force uncertainty : {:.16f}'.format(Fstd.max()))
-                self.logger.info('Max stress uncertainty: {:.16f}'.format(Sstd.max()))
-
+                predE, predF, predS = self.__predict_from_sgp(mode='dtc') 
                 self.__update_structure_efs(pe, forces, stress)
 
                 # log data based on DFT calculation
-                self.logger.info('|ΔE per atom|: {:.16f}'.format(np.abs(pe - predE) / natoms))
-                self.logger.info('Max |ΔForce| : {:.16f}'.format(np.abs(forces - predF).max()))
-                self.logger.info('Max |ΔStress|: {:.16f}'.format(np.abs(stress - predS).max()))
+                errF = np.abs(forces - predF)
+                errS = np.abs(stress - predS)
+                self.logger.info('DFT energy error [meV/atom]  : {:^14.8f}'.format(1000 * np.abs(pe - predE) / natoms))
+                self.logger.info('Max DFT force error [meV/Å]  : {:^14.8f}'.format(1000 * errF.max()))
+                self.logger.info('Max DFT stress error [GPa]   : {:^14.8f}'.format(eVperA3_to_GPa * errS.max()))
+                if self.wandb is not None:  # wandb logging
+                    wandb_log = {'max_cluster_uncertainty': stds.max()}
+                    wandb_log['max_force_error'] = 1000 * errF.max()
+                    wandb_log['log_rel_force_error'] = self.wandb.Histogram(np.log10(errF / np.abs(forces)).ravel())
+                    wandb_log['max_stress_error'] = eVperA3_to_GPa * errS.max()
+                    wandb_log['log_rel_stress_error'] = self.wandb.Histogram(np.log10(errS / np.abs(stress)).ravel())
+                    self.wandb.log(wandb_log, step=self.calls)
 
                 if add_envs:
                     self.dft_calls += 1  # to reproduce hyperparameter optimization calls
@@ -402,7 +400,8 @@ class FlareOTF(Calculator):
                         self.time_hyp_opt += time.time() - t0
                         self.hyp_opts += 1
                         self.dn_atenvs_since_hypopt = 0
-                self.t0 = time.time()
+
+            self.calls += 1
 
         offline_training_time = time.time() - t_offline_start
         self.logger.info('Time spent offline training: {} s'.format(offline_training_time))
@@ -480,7 +479,7 @@ class FlareOTF(Calculator):
         """
         t0 = time.time()
         self.sparse_gp.add_training_structure(self.structure)
-        if init:  # add quarter of atoms in structure randomly
+        if init:
             self.sparse_gp.add_random_environments(self.structure, [atoms_to_add])
             self.logger.info('Added {} random atomic environments'.format(atoms_to_add))
             self.dn_atenvs_since_hypopt += atoms_to_add
@@ -490,6 +489,45 @@ class FlareOTF(Calculator):
             self.dn_atenvs_since_hypopt += len(atoms_to_add)
         self.sparse_gp.update_matrices_QR()
         self.time_training += time.time() - t0
+
+    def __predict_from_sgp(self, mode='mean'):
+        """
+        mode (str): 'mean' (only mean) or 'dtc' (mean & DTC variance)
+        """
+        # get SGP prediction
+        assert mode == 'mean' or mode == 'dtc'
+        t0 = time.time()
+        if mode == 'mean':
+            self.sparse_gp.predict_mean(self.structure)
+        elif mode == 'dtc':
+            self.sparse_gp.predict_DTC(self.structure)
+        self.time_prediction += time.time() - t0
+         
+        # collect mean predictions
+        predE = self.structure.mean_efs[0]
+        predF = self.structure.mean_efs[1:-6].reshape((-1, 3)).copy()
+        predS = flare2ase(self.structure.mean_efs[-6:].copy())
+        natoms = predF.shape[0]
+
+        if mode == 'dtc':  # log uncertainties
+            # get DTC SGP variance (epistemic uncertainty)
+            Evar = np.abs(self.structure.variance_efs[0])
+            Fvar = np.abs(self.structure.variance_efs[1:-6]).reshape((-1, 3))
+            Svar = np.abs(self.structure.variance_efs[-6:])
+            # combine with noise hyperparameter uncertainty
+            E_noise, F_noise, S_noise = self.sparse_gp.hyperparameters[1:4]
+            E_uncertainty = np.sqrt((Evar + E_noise * E_noise) / natoms) * 1000
+            F_uncertainty = np.sqrt(Fvar + F_noise * F_noise) * 1000
+            S_uncertainty = np.sqrt(Svar + S_noise * S_noise).max() * eVperA3_to_GPa
+            # log uncertainties for energy, forces and stress
+            # format: total uncertainty, epistemic uncertainty, model noise
+            self.logger.info('Energy uncertainty [meV/atom]: {:^14.8f}  {:^14.8f}  {:^14.8f}'
+                             .format(E_uncertainty, np.sqrt(Evar / natoms) * 1000, np.abs(E_noise) * 1000 / np.sqrt(natoms)))
+            self.logger.info('Max force uncertainty [meV/Å]: {:^14.8f}  {:^14.8f}  {:^14.8f}'
+                             .format(F_uncertainty.max(), np.sqrt(Fvar).max() * 1000, np.abs(F_noise) * 1000))
+            self.logger.info('Max stress uncertainty [GPa] : {:^14.8f}  {:^14.8f}  {:^14.8f}'
+                             .format(S_uncertainty, np.sqrt(Svar).max() * eVperA3_to_GPa, np.abs(S_noise) * eVperA3_to_GPa))
+        return predE, predF, predS
 
     def record_state(self, fname):
 
@@ -511,7 +549,7 @@ class FlareOTF(Calculator):
 
             f.write('HYPERPARAMETERS\n')
             f.write('Kernel Noise        : {:.10f}\n'.format(np.abs(self.sparse_gp.hyperparameters[0])))
-            f.write('Energy Noise        : {:.10f}\n'.format(np.abs(self.sparse_gp.hyperparameters[1])))
-            f.write('Force Noise         : {:.10f}\n'.format(np.abs(self.sparse_gp.hyperparameters[2])))
-            f.write('Stress Noise        : {:.10f}\n'.format(np.abs(self.sparse_gp.hyperparameters[3])))
+            f.write('Energy Noise [eV]   : {:.10f}\n'.format(np.abs(self.sparse_gp.hyperparameters[1])))
+            f.write('Force Noise [meV/Å] : {:.10f}\n'.format(1000 * np.abs(self.sparse_gp.hyperparameters[2])))
+            f.write('Stress Noise [GPa]  : {:.10f}\n'.format(eVperA3_to_GPa * np.abs(self.sparse_gp.hyperparameters[3])))
             f.write('Times optimized     : {}\n'.format(self.hyp_opts))
