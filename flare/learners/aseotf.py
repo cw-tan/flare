@@ -307,6 +307,14 @@ class FlareOTF(Calculator):
                             self.time_hyp_opt += time.time() - t0
                             self.hyp_opts += 1
                             self.dn_atenvs_since_hypopt = 0
+
+                        if self.wandb is not None:  # wandb logging for hyperparameters
+                            wandb_log = {'kernel_outputscale': np.abs(self.sparse_gp.hyperparameters[0])}
+                            wandb_log['energy_noise'] = np.abs(self.sparse_gp.hyperparameters[1])
+                            wandb_log['force_noise'] = 1000 * np.abs(self.sparse_gp.hyperparameters[2])
+                            wandb_log['stress_noise'] = eVperA3_to_GPa * np.abs(self.sparse_gp.hyperparameters[3])
+                            self.wandb.log(wandb_log, step=self.dft_calls)  # only log when DFT called
+
             self.calls += 1
             self.record_state(self.path + '/flare_aseotf.state')
 
@@ -357,7 +365,7 @@ class FlareOTF(Calculator):
             self.__reset_structure(frame)  # sets up the SGP structure object (among other things)
             if j == 0:
                 self.__update_structure_efs(pe, forces, stress)
-                self.__update_sgp(init=True, atoms_to_add=int(natoms / 4))
+                self.__update_sgp(init=True, atoms_to_add=int(natoms / 2))
             else:
                 # get uncertainties
                 t0 = time.time()
@@ -375,16 +383,20 @@ class FlareOTF(Calculator):
                 errF = np.abs(forces - predF)
                 errS = np.abs(stress - predS)
                 self.logger.info('DFT energy error [meV/atom]  : {:^14.8f}'.format(1000 * np.abs(pe - predE) / natoms))
-                self.logger.info('Max DFT force error [meV/Å]  : {:^14.8f}'.format(1000 * errF.max()))
-                self.logger.info('Max DFT stress error [GPa]   : {:^14.8f}'.format(eVperA3_to_GPa * errS.max()))
+                self.logger.info('Max & Mean DFT force error [meV/Å]  : {:^14.8f} {:^14.8f}'
+                                 .format(1000 * errF.max(), 1000 * np.mean(errF)))
+                self.logger.info('Max & Mean DFT stress error [GPa]   : {:^14.8f} {:^14.8f}'
+                                 .format(eVperA3_to_GPa * errS.max(), eVperA3_to_GPa * np.mean(errS)))
                 if self.wandb is not None:  # wandb logging
                     wandb_log = {'max_cluster_uncertainty': stds.max()}
                     wandb_log['max_force_error'] = 1000 * errF.max()
+                    wandb_log['mean_force_error'] = 1000 * np.mean(errF)
                     wandb_log['log_rel_force_error'] = self.wandb.Histogram(np.log10(errF / np.abs(forces)).ravel())
                     wandb_log['max_stress_error'] = eVperA3_to_GPa * errS.max()
+                    wandb_log['mean_stress_error'] = eVperA3_to_GPa * np.mean(errS)
                     wandb_log['log_rel_stress_error'] = self.wandb.Histogram(np.log10(errS / np.abs(stress)).ravel())
-                    self.wandb.log(wandb_log, step=self.calls)
-
+                    wandb_log['aseotf_call'] = self.calls
+                    self.wandb.log(wandb_log, step=self.dft_calls)  # only log when DFT called
                 if add_envs:
                     self.dft_calls += 1  # to reproduce hyperparameter optimization calls
                     # update SGP and potentially optimize SGP hyperparameters
@@ -400,6 +412,13 @@ class FlareOTF(Calculator):
                         self.time_hyp_opt += time.time() - t0
                         self.hyp_opts += 1
                         self.dn_atenvs_since_hypopt = 0
+
+                if self.wandb is not None:  # wandb logging for hyperparameters
+                    wandb_log = {'kernel_outputscale': np.abs(self.sparse_gp.hyperparameters[0])}
+                    wandb_log['energy_noise'] = np.abs(self.sparse_gp.hyperparameters[1])
+                    wandb_log['force_noise'] = 1000 * np.abs(self.sparse_gp.hyperparameters[2])
+                    wandb_log['stress_noise'] = eVperA3_to_GPa * np.abs(self.sparse_gp.hyperparameters[3])
+                    self.wandb.log(wandb_log, step=self.dft_calls)
 
             self.calls += 1
 
